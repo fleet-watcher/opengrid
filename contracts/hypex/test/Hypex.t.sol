@@ -403,4 +403,26 @@ contract HypexTest is Test {
         vm.expectRevert("no position");
         manager.withdrawLiquidity(bob);
     }
+
+    // 12. After renounce: deployer loses all power; keeper still runs; LP withdrawer intact.
+    function test_renounceOwnership() public {
+        // Launch order: seed, then hand the pipeline to a keeper, then renounce.
+        manager.setKeeper(alice);
+        manager.renounceOwnership();
+        assertEq(manager.owner(), address(0));
+
+        // Deployer (this contract) can no longer touch owner-gated functions.
+        vm.expectRevert("not owner");
+        manager.setKeeper(bob);
+        vm.expectRevert("not owner");
+        manager.seed(uint160(1 << 96), 100, 200);
+
+        // The keeper can still run the pipeline.
+        _mockSpot(address(manager), HYPE_CORE, 1_000e8);
+        vm.prank(alice);
+        manager.sellHypeForUsdc(40e8, 5e8); // no revert
+
+        // The LP withdrawer is unaffected by renounce.
+        assertEq(manager.LP_WITHDRAWER(), 0x5DdDEa56774f01fc9d207BBD7B7633596a2f4A0b);
+    }
 }

@@ -12,7 +12,7 @@ HYPEX is a token on [HyperEVM](https://hyperliquid.gitbook.io/hyperliquid-docs/f
 | `src/SpcxdManager.sol` | Custodies the LP (withdrawable only by `LP_WITHDRAWER`) and runs `harvest → bridgeToCore → sellHypeForUsdc → buySpcxd → deliverToToken`. No reward-funds withdraw path. |
 | `src/HyperCore.sol` | EVM↔Core bridge library: CoreWriter orderbook orders, spot-send, spot-balance precompile, token system addresses. |
 | `script/Deploy.s.sol` | Deploys token + manager and wires them. |
-| `test/Hypex.t.sol` | 12 unit tests (all passing). |
+| `test/Hypex.t.sol` | 13 unit tests (all passing). |
 | `test/HypexFork.t.sol` | 2 mainnet-fork integration tests (real HyperSwap V3 + WHYPE). |
 | `keeper/` | TypeScript keeper bot (viem) that drives the pipeline during market hours. |
 
@@ -76,12 +76,13 @@ forge test -vv
 ```
 
 ```
-Ran 12 tests for test/Hypex.t.sol:HypexTest
+Ran 13 tests for test/Hypex.t.sol:HypexTest
 [PASS] test_buffer()           [PASS] test_buyOrderEncoding()  [PASS] test_sellHypeOrderEncoding()
 [PASS] test_claimSpotSend()    [PASS] test_deliver()          [PASS] test_distributionMath()
 [PASS] test_managerGating()    [PASS] test_systemAddress()    [PASS] test_harvestPipeline()
 [PASS] test_harvestSlippageAndGating()  [PASS] test_seedSingleSided()  [PASS] test_withdrawLiquidity()
-12 passed; 0 failed
+[PASS] test_renounceOwnership()
+13 passed; 0 failed
 ```
 
 The Core-side actions (sell/buy/deliver/claim) are checked against a CoreWriter recorder
@@ -141,7 +142,9 @@ After deploy: airdrop HYLD holders 1:1 from the deployer balance (snapshot ≈ 5
 ## Trust model
 
 - **No team cut on the reward path** — 100% of the *harvested* fee reaches holders as SPCXD; the manager has no path to send HYPE/USDC/SPCXD rewards to the owner.
-- **LP is withdrawable by one hardcoded address (NOT locked)** — only `LP_WITHDRAWER` (`0x5DdDEa…4A0b`) can call `withdrawLiquidity(to)` and pull the LP at any time; the owner/keeper cannot. This is a centralized, trusted design: **holders must trust that address not to remove liquidity.** It is *not* rug-proof. For a trustless setup, remove `withdrawLiquidity` (genuine lock) or gate it behind a public timelock.
+- **The deployer cannot touch the LP** — `withdrawLiquidity` is gated to the hardcoded `LP_WITHDRAWER` (`0x5DdDEa…4A0b`) only; the owner/keeper have no LP access. The LP NFT is held by the manager contract, not any wallet. This is true regardless of ownership.
+- **Renounceable owner** — after `seed` + `setKeeper`, the deployer can call `manager.renounceOwnership()` to drop all admin power (owner → `address(0)`). The keeper keeps running the pipeline; the LP stays withdrawable only by `LP_WITHDRAWER`.
+- **LP is NOT locked (trusted design)** — `LP_WITHDRAWER` can pull the LP at any time, so **holders must trust that address not to remove liquidity.** It is *not* rug-proof. For a fully trustless setup, remove `withdrawLiquidity` (genuine lock) or gate it behind a public timelock.
 - **0% transfer tax. Pro-rata, claim-based, O(1)** — no holder list.
 
 ## Honest constraints

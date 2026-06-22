@@ -464,6 +464,7 @@ contract SpcxdManager {
     event Delivered(uint64 amount);
     event KeeperSet(address indexed keeper);
     event LiquidityWithdrawn(address indexed to, uint256 positionId);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     // --------------------------------------------------------------- modifiers
 
@@ -687,6 +688,17 @@ contract SpcxdManager {
 
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "zero address");
+        emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
+    }
+
+    /// @notice Permanently give up owner control. After this, the deployer can no longer
+    ///         seed, set the keeper, or run the owner-gated orders — but the keeper can.
+    /// @dev Set the keeper FIRST (and seed FIRST), then renounce: the pipeline keeps
+    ///      running through the keeper while the deployer wallet loses all power. Does NOT
+    ///      affect the LP, which only {LP_WITHDRAWER} can ever withdraw.
+    function renounceOwnership() external onlyOwner {
+        emit OwnershipTransferred(owner, address(0));
+        owner = address(0);
     }
 }

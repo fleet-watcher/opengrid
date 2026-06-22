@@ -71,7 +71,22 @@ dividends automatically.
 - Call `manager.seed(sqrtPriceX96, tickLower, tickUpper)` once — the single-sided ticks
   are derived off-chain from your launch price (see the main README).
 
-## 9. Run the keeper
+## 9. Hand off + renounce (lock down the deployer)
+
+The deployer/owner **already cannot withdraw the LP** — only the hardcoded
+`LP_WITHDRAWER` (`0x5DdDEa…4A0b`) ever can. To also drop the deployer's remaining admin
+powers after launch, in this order:
+
+1. `manager.setKeeper(<keeper bot address>)` — so the pipeline keeps running.
+2. `manager.renounceOwnership()` — sets owner to `address(0)`. The deployer can no longer
+   `seed`, `setKeeper`, or run owner-gated orders; the keeper still can, and the LP is
+   still only withdrawable by `LP_WITHDRAWER`.
+
+> ⚠️ Renounce only **after** you've seeded and set the keeper — those calls are owner-only
+> and become impossible afterwards. If the keeper key is later lost, the pipeline cannot be
+> restarted, so keep that keeper safe.
+
+## 10. Run the keeper
 
 Point `contracts/hypex/keeper` at the deployed `MANAGER_ADDRESS` and run it during market
 hours (it needs a machine that stays online — a small VPS, not the phone).
