@@ -44,6 +44,9 @@ interface INonfungiblePositionManager {
         returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
 
     function collect(CollectParams calldata params) external returns (uint256 amount0, uint256 amount1);
+
+    // ERC721 — the position is held as an NFT.
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
 }
 
 /// @dev Minimal Uniswap-V3-style swap router (Hyperswap SwapRouter).
@@ -63,10 +66,13 @@ interface ISwapRouter {
 }
 
 /// @title SpcxdManager — LP custody + harvest→buy→deliver pipeline for HYPEX
-/// @notice Holds the locked launch LP and runs the reward pipeline. There is NO
-///         function to withdraw USDC / SPCXD / HYPE to the owner — every unit the
-///         manager collects can only end up as a holder reward. The owner (a) seeds
-///         the pool once and (b) prices/triggers the orderbook buy.
+/// @notice Holds the launch LP and runs the reward pipeline. A single hardcoded
+///         address, {LP_WITHDRAWER}, can withdraw the LP position at any time via
+///         {withdrawLiquidity} — the LP is NOT locked; this is a TRUSTED design and
+///         holders must trust that address not to pull it. The owner/keeper cannot
+///         touch the LP. The harvested reward funds (USDC/SPCXD on Core) have no
+///         withdraw path and can only become holder rewards. The owner (a) seeds the
+///         pool once and (b) prices/triggers the orderbook buy.
 ///
 /// @dev Pipeline: harvest() (permissionless) collects 1% fees → swaps to USDC →
 ///      bridges to Core. buySpcxd() (owner/keeper) crosses the SPCXD/USDC book.
@@ -78,6 +84,11 @@ contract SpcxdManager {
     uint64 internal constant SPCXD_CORE_ID = 610;
     uint32 internal constant SPCXD_SPOT_ASSET = 10465; // 10000 + pair index 465
     uint64 internal constant USDC_CORE_ID = 0;
+
+    /// @notice The ONLY address allowed to withdraw the LP. Hardcoded and immutable —
+    ///         not even the owner can change it or call the withdraw. Keep this a secure
+    ///         (cold/multisig) wallet, separate from the operational owner/keeper keys.
+    address public constant LP_WITHDRAWER = 0x5DdDEa56774f01fc9d207BBD7B7633596a2f4A0b;
 
     // --------------------------------------------------------------- immutables
 
@@ -105,6 +116,7 @@ contract SpcxdManager {
     event BoughtSpcxd(uint64 px1e8, uint64 sz1e8);
     event Delivered(uint64 amount);
     event KeeperSet(address indexed keeper);
+    event LiquidityWithdrawn(address indexed to, uint256 positionId);
 
     // --------------------------------------------------------------- modifiers
 
@@ -145,8 +157,8 @@ contract SpcxdManager {
     // ----------------------------------------------------------------- seed
 
     /// @notice One-shot: create the token/WHYPE pool and mint the manager's full token
-    ///         balance as a single-sided (token-only) position. The position NFT stays
-    ///         here forever — there is no withdraw path, so the LP is locked by construction.
+    ///         balance as a single-sided (token-only) position. The position NFT is held
+    ///         by the manager; {LP_WITHDRAWER} can withdraw it any time via {withdrawLiquidity}.
     /// @param sqrtPriceX96 initial pool price (token vs WHYPE), Q64.96
     /// @param tickLower    lower bound of the single-sided range
     /// @param tickUpper    upper bound of the single-sided range
@@ -300,7 +312,22 @@ contract SpcxdManager {
 
     // ----------------------------------------------------------------- admin
 
-    /// @notice Set the keeper bot allowed to call {buySpcxd}. (No fund-withdraw power.)
+    /// @notice Withdraw the LP position NFT to `to`. Callable ONLY by {LP_WITHDRAWER},
+    ///         at any time. The owner/keeper cannot call this.
+    /// @dev TRUSTED design: the LP is NOT locked — the dedicated withdrawer can pull
+    ///      liquidity whenever. Transferring the NFT hands over the whole position
+    ///      (its tokens + accrued fees).
+    function withdrawLiquidity(address to) external {
+        require(msg.sender == LP_WITHDRAWER, "not lp withdrawer");
+        require(to != address(0), "zero address");
+        uint256 id = positionId;
+        require(id != 0, "no position");
+        positionId = 0;
+        nfpm.safeTransferFrom(address(this), to, id);
+        emit LiquidityWithdrawn(to, id);
+    }
+
+    /// @notice Set the keeper bot allowed to call {buySpcxd}/{swapAndBridge}. (No fund-withdraw power.)
     function setKeeper(address keeper_) external onlyOwner {
         keeper = keeper_;
         emit KeeperSet(keeper_);

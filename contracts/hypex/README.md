@@ -1,16 +1,18 @@
 # HYPEX — holders earn SPCXD from the pool fee
 
-HYPEX is a token on [HyperEVM](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm) (chain `999`) whose holders earn **SPCXD** (tokenized SpaceX dStock) out of a **1% pool fee**. The fee is harvested, routed to USDC, bridged to HyperCore, spent buying SPCXD on the HyperCore orderbook, and delivered straight to each holder's own Core account when they claim. No team cut, no fund withdrawal, LP locked by construction.
+HYPEX is a token on [HyperEVM](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm) (chain `999`) whose holders earn **SPCXD** (tokenized SpaceX dStock) out of a **1% pool fee**. The fee is harvested, routed to USDC, bridged to HyperCore, spent buying SPCXD on the HyperCore orderbook, and delivered straight to each holder's own Core account when they claim. No team cut; the harvested reward funds can only become holder rewards.
+
+> ⚠️ **Trusted LP (not locked).** A single hardcoded address, `LP_WITHDRAWER` (`0x5DdDEa56774f01fc9d207BBD7B7633596a2f4A0b`), can withdraw the LP position at any time via `manager.withdrawLiquidity(to)`. The owner/keeper cannot touch it. This is a deliberate, centralized design — **holders must trust that address not to pull liquidity.** The LP is *not* locked and this is *not* a rug-proof setup. Only the harvested reward funds (USDC/SPCXD on Core) have no withdraw path.
 
 ## Contracts
 
 | File | Purpose |
 | --- | --- |
 | `src/SpcxdToken.sol` | The launch ERC20 (0% tax, 18 dec). Holds the SPCXD dividend accumulator; holders `claimSpcxd()` here. |
-| `src/SpcxdManager.sol` | Custodies the locked LP and runs `harvest → buySpcxd → deliverToToken`. **No** USDC/SPCXD/HYPE withdraw path. |
+| `src/SpcxdManager.sol` | Custodies the LP (owner-withdrawable) and runs `harvest → buySpcxd → deliverToToken`. **No** USDC/SPCXD/HYPE reward withdraw path. |
 | `src/HyperCore.sol` | EVM↔Core bridge library: CoreWriter orderbook orders, spot-send, spot-balance precompile, token system addresses. |
 | `script/Deploy.s.sol` | Deploys token + manager and wires them. |
-| `test/Hypex.t.sol` | 10 unit tests (all passing). |
+| `test/Hypex.t.sol` | 11 unit tests (all passing). |
 | `keeper/` | TypeScript keeper bot (viem) that drives the pipeline during market hours. |
 
 ## How it works
@@ -24,7 +26,7 @@ HYPEX is a token on [HyperEVM](https://hyperliquid.gitbook.io/hyperliquid-docs/f
 - Exclusions (pool, manager, reserve, dead) hold 0 shares so they don't dilute real holders.
 
 **The pipeline (manager).**
-1. `seed(sqrtPriceX96, tickLower, tickUpper)` (owner, one-shot): creates the token/WHYPE 1% pool and mints the manager's full token balance as a single-sided (token-only) position. The LP NFT stays in the manager forever — there is no withdraw, so the LP is locked by construction.
+1. `seed(sqrtPriceX96, tickLower, tickUpper)` (owner, one-shot): creates the token/WHYPE 1% pool and mints the manager's full token balance as a single-sided (token-only) position. The LP NFT is held by the manager; the hardcoded `LP_WITHDRAWER` address can withdraw it any time via `withdrawLiquidity(to)` (the LP is **not** locked — see the trusted-LP note above).
 2. `harvest()` (permissionless): `collect()` the accrued fees into the manager. Slippage-free, so anyone may pull fees in.
 3. `swapAndBridge(minWhypeOut, minUsdcOut)` (owner/keeper): swap the token side → WHYPE → USDC and bridge USDC EVM→Core. The slippage floors come from a fresh quote (the keeper reads the post-harvest balances, quotes each leg, and applies its tolerance) so the swaps can't be sandwiched.
 4. `buySpcxd(px1e8, sz1e8)` (owner/keeper): IOC ("market-style") buy on the SPCXD/USDC book (asset `10465 = 10000 + 465`) using the Core USDC balance. Owner/keeper-gated because it needs live market data and dStock trades only during the SpaceX session.
@@ -52,12 +54,12 @@ forge test -vv
 ```
 
 ```
-Ran 10 tests for test/Hypex.t.sol:HypexTest
+Ran 11 tests for test/Hypex.t.sol:HypexTest
 [PASS] test_buffer()           [PASS] test_buyOrderEncoding()  [PASS] test_claimSpotSend()
 [PASS] test_deliver()          [PASS] test_distributionMath()  [PASS] test_managerGating()
 [PASS] test_systemAddress()    [PASS] test_harvestPipeline()   [PASS] test_harvestSlippageAndGating()
-[PASS] test_seedLocksLp()
-10 passed; 0 failed
+[PASS] test_seedSingleSided()  [PASS] test_withdrawLiquidity()
+11 passed; 0 failed
 ```
 
 The Core-side actions (buy/deliver/claim) are checked against a CoreWriter recorder
@@ -100,11 +102,10 @@ After deploy: airdrop HYLD holders 1:1 from the deployer balance (snapshot ≈ 5
 
 > **CoreWriter caller rule (validated on mainnet):** CoreWriter actions only execute when the sender is a *contract*, not an EOA — which is exactly why the token and manager run them. The token-bridge transfer to a system address works from either.
 
-## Trust properties
+## Trust model
 
-- **No team cut** — 100% of the fee reaches holders as SPCXD.
-- **No fund withdraw** — the manager cannot send USDC/SPCXD/HYPE to the owner; collected value can only become a reward.
-- **LP locked by construction** — there is no `withdrawLiquidity`; the position NFT cannot leave the manager.
+- **No team cut on the reward path** — 100% of the *harvested* fee reaches holders as SPCXD; the manager has no path to send USDC/SPCXD/HYPE rewards to the owner.
+- **LP is withdrawable by one hardcoded address (NOT locked)** — only `LP_WITHDRAWER` (`0x5DdDEa…4A0b`) can call `withdrawLiquidity(to)` and pull the LP position at any time; the owner/keeper cannot. This is a centralized, trusted design: **holders must trust that address not to remove liquidity.** It is *not* rug-proof. If you want a trustless setup instead, remove `withdrawLiquidity` (genuine lock) or gate it behind a public timelock.
 - **0% transfer tax. Pro-rata, claim-based, O(1)** — no holder list.
 
 ## Honest constraints

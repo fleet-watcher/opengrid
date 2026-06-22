@@ -91,6 +91,14 @@ contract MockNFPM {
         if (whypeFee > 0) whype.mint(p.recipient, whypeFee);
         return (whypeFee, 0);
     }
+
+    address public lastTransferTo;
+    uint256 public lastTransferId;
+
+    function safeTransferFrom(address, address to, uint256 tokenId) external {
+        lastTransferTo = to;
+        lastTransferId = tokenId;
+    }
 }
 
 interface MockERC20Like {
@@ -330,8 +338,8 @@ contract HypexTest is Test {
         manager.swapAndBridge(0, 0);
     }
 
-    // 10. Seed: single-sided mint locks the full token balance; the LP NFT stays put.
-    function test_seedLocksLp() public {
+    // 10. Seed: single-sided mint deposits the full token balance into one V3 position.
+    function test_seedSingleSided() public {
         token.transfer(address(manager), 5_060e18); // LP allocation
         manager.seed(uint160(1 << 96), 100, 200);
 
@@ -344,5 +352,35 @@ contract HypexTest is Test {
         // One-shot.
         vm.expectRevert("seeded");
         manager.seed(uint160(1 << 96), 100, 200);
+    }
+
+    // 11. LP is withdrawable only by the hardcoded LP_WITHDRAWER (TRUSTED design — not locked).
+    function test_withdrawLiquidity() public {
+        token.transfer(address(manager), 5_060e18);
+        manager.seed(uint160(1 << 96), 100, 200);
+        uint256 id = manager.positionId();
+
+        address withdrawer = manager.LP_WITHDRAWER();
+
+        // Not even the owner (this test contract) can pull it.
+        vm.expectRevert("not lp withdrawer");
+        manager.withdrawLiquidity(bob);
+
+        // A random address can't either.
+        vm.prank(alice);
+        vm.expectRevert("not lp withdrawer");
+        manager.withdrawLiquidity(alice);
+
+        // Only LP_WITHDRAWER can.
+        vm.prank(withdrawer);
+        manager.withdrawLiquidity(bob);
+        assertEq(nfpm.lastTransferTo(), bob);
+        assertEq(nfpm.lastTransferId(), id);
+        assertEq(manager.positionId(), 0);
+
+        // Nothing left to withdraw.
+        vm.prank(withdrawer);
+        vm.expectRevert("no position");
+        manager.withdrawLiquidity(bob);
     }
 }
