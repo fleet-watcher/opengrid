@@ -40,6 +40,26 @@ The collect and deliver legs are permissionless; only the slippage-sensitive swa
 - USDC core id `0`; CoreWriter `0x33…33`; spot-balance precompile `0x…0801`; HYPE system address `0x22…22`.
 - Token system address = `0x20` top byte + token index big-endian (USDC `0` → `0x2000…0000`).
 
+### Verified HyperSwap V3 + token addresses (HyperEVM mainnet, chain 999)
+
+All labels confirmed on [hyperevmscan.io](https://hyperevmscan.io). Baked in as
+overridable defaults in `script/Deploy.s.sol` and `keeper/.env.example`.
+
+| Contract | Address |
+| --- | --- |
+| WHYPE | `0x5555555555555555555555555555555555555555` |
+| HyperSwap V3 SwapRouter (with deadline) | `0x4E2960a8cd19B467b82d26D83fAcb0fAE26b094D` |
+| HyperSwap V3 NonfungiblePositionManager | `0x6eDA206207c09e5428F281761DdC0D300851fBC8` |
+| HyperSwap V3 Quoter v2 (keeper) | `0x03A918028f22D9E1473B7959C927AD7425A45C7C` |
+| USDC — Hyperliquid (bridges to Core token 0) | `0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24` |
+| USDC — Circle native (alternative) | `0xb88339CB7199b77E23DB6E890353E22632Ba630f` |
+
+> **USDC caveat:** the bridge only credits your Core USDC if the EVM USDC you use is
+> the one linked to HyperCore token 0. The spec/validated build used the Hyperliquid
+> USDC (`0x6B9E…0A24`); Circle's native USDC launched later. Confirm which one (a)
+> bridges to Core token 0 and (b) has a liquid WHYPE/USDC V3 pool **before** mainnet,
+> and set `WHYPE_USDC_FEE` to that pool's fee tier.
+
 ### Decimals
 
 - HYPEX: 18 dec (EVM). USDC: 6 dec EVM / 8 dec Core. SPCXD: 8 dec Core (18 dec ERC20 unused).
