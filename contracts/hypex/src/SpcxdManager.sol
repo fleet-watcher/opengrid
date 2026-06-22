@@ -10,6 +10,11 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
+/// @dev WHYPE is WHYPE (wrapped HYPE), WETH9-style: `withdraw` unwraps to native HYPE.
+interface IWHYPE {
+    function withdraw(uint256 amount) external;
+}
+
 /// @dev Minimal Uniswap-V3-style position manager (Hyperswap NFPM).
 interface INonfungiblePositionManager {
     struct MintParams {
@@ -70,20 +75,32 @@ interface ISwapRouter {
 ///         address, {LP_WITHDRAWER}, can withdraw the LP position at any time via
 ///         {withdrawLiquidity} — the LP is NOT locked; this is a TRUSTED design and
 ///         holders must trust that address not to pull it. The owner/keeper cannot
-///         touch the LP. The harvested reward funds (USDC/SPCXD on Core) have no
+///         touch the LP. The funds in flight (HYPE/USDC/SPCXD on Core) have no
 ///         withdraw path and can only become holder rewards. The owner (a) seeds the
-///         pool once and (b) prices/triggers the orderbook buy.
+///         pool once and (b) prices/triggers the Core orderbook orders.
 ///
-/// @dev Pipeline: harvest() (permissionless) collects 1% fees → swaps to USDC →
-///      bridges to Core. buySpcxd() (owner/keeper) crosses the SPCXD/USDC book.
-///      deliverToToken() (permissionless) spot-sends the bought SPCXD to the token
-///      and books it for holders. Fills and bridges are async (settle 1–2 blocks).
+/// @dev Pipeline (HYPE route — uses only mainnet-validated primitives):
+///      1. harvest()           collect the 1% fees                        (permissionless)
+///      2. bridgeToCore(min)   launch-token→WHYPE, unwrap WHYPE→HYPE,
+///                             send HYPE to the HYPE system address        (owner/keeper)
+///      3. sellHypeForUsdc()   sell Core HYPE for USDC on HYPE/USDC book   (owner/keeper)
+///      4. buySpcxd()          buy SPCXD on the SPCXD/USDC book            (owner/keeper)
+///      5. deliverToToken()    spot-send SPCXD to the token, book reward   (permissionless)
+///
+///      Token-0 USDC on HyperCore is system-managed (its EVM ERC20 reverts for non-system
+///      callers and has no DEX pool), so USDC is acquired by SELLING on the Core orderbook
+///      — never by swapping/bridging an EVM USDC token. Fills/bridges settle 1–2 blocks later.
 contract SpcxdManager {
-    // --------------------------------------------------------------- core ids
+    // --------------------------------------------------------------- core ids / assets
 
     uint64 internal constant SPCXD_CORE_ID = 610;
-    uint32 internal constant SPCXD_SPOT_ASSET = 10465; // 10000 + pair index 465
+    uint32 internal constant SPCXD_SPOT_ASSET = 10465; // SPCXD/USDC, 10000 + pair index 465
     uint64 internal constant USDC_CORE_ID = 0;
+    uint64 internal constant HYPE_CORE_ID = 150;
+    uint32 internal constant HYPE_USDC_ASSET = 10107; // HYPE/USDC, 10000 + pair index 107
+
+    /// @dev Native HYPE bridges EVM→Core by a plain value transfer to this system address.
+    address internal constant HYPE_SYSTEM = 0x2222222222222222222222222222222222222222;
 
     /// @notice The ONLY address allowed to withdraw the LP. Hardcoded and immutable —
     ///         not even the owner can change it or call the withdraw. Keep this a secure
@@ -94,25 +111,24 @@ contract SpcxdManager {
 
     SpcxdToken public immutable token;
     address public immutable whype;
-    address public immutable usdc; // EVM USDC (6 dec)
     INonfungiblePositionManager public immutable nfpm;
     ISwapRouter public immutable router;
     uint24 public immutable launchPoolFee; // 1% pool = 10000
-    uint24 public immutable whypeUsdcFee; // fee tier of the WHYPE/USDC pool
 
     // --------------------------------------------------------------- state
 
     address public owner;
     address public keeper;
     address public pool;
-    uint256 public positionId; // the locked V3 LP NFT
+    uint256 public positionId; // the LP NFT
     bool public seeded;
 
     // --------------------------------------------------------------- events
 
     event Seeded(address indexed pool, uint256 positionId, uint256 tokenLiquidity);
     event Harvested(uint256 collected0, uint256 collected1);
-    event SwappedAndBridged(uint256 usdcBridged);
+    event BridgedToCore(uint256 hypeBridged);
+    event SoldHypeForUsdc(uint64 px1e8, uint64 sz1e8);
     event BoughtSpcxd(uint64 px1e8, uint64 sz1e8);
     event Delivered(uint64 amount);
     event KeeperSet(address indexed keeper);
@@ -133,26 +149,25 @@ contract SpcxdManager {
     constructor(
         SpcxdToken token_,
         address whype_,
-        address usdc_,
         INonfungiblePositionManager nfpm_,
         ISwapRouter router_,
-        uint24 launchPoolFee_,
-        uint24 whypeUsdcFee_
+        uint24 launchPoolFee_
     ) {
         require(
-            address(token_) != address(0) && whype_ != address(0) && usdc_ != address(0)
-                && address(nfpm_) != address(0) && address(router_) != address(0),
+            address(token_) != address(0) && whype_ != address(0) && address(nfpm_) != address(0)
+                && address(router_) != address(0),
             "zero address"
         );
         token = token_;
         whype = whype_;
-        usdc = usdc_;
         nfpm = nfpm_;
         router = router_;
         launchPoolFee = launchPoolFee_;
-        whypeUsdcFee = whypeUsdcFee_;
         owner = msg.sender;
     }
+
+    /// @dev Accept native HYPE produced by unwrapping WHYPE.
+    receive() external payable {}
 
     // ----------------------------------------------------------------- seed
 
@@ -204,7 +219,7 @@ contract SpcxdManager {
 
     /// @notice Collect the accrued 1% fees from the locked position into the manager.
     /// @dev Permissionless. Slippage-free (no swap), so anyone may pull fees in.
-    ///      Pair with {swapAndBridge}, which the keeper calls with fresh slippage floors.
+    ///      Pair with {bridgeToCore}, which the keeper calls with a fresh slippage floor.
     function harvest() external returns (uint256 collected0, uint256 collected1) {
         (collected0, collected1) = nfpm.collect(
             INonfungiblePositionManager.CollectParams({
@@ -217,15 +232,15 @@ contract SpcxdManager {
         emit Harvested(collected0, collected1);
     }
 
-    /// @notice Route the manager's launch-token + WHYPE balance to USDC and bridge it to Core.
+    // ------------------------------------------------------------ step 2: bridge to Core
+
+    /// @notice Convert the manager's launch-token + WHYPE balance to native HYPE and bridge
+    ///         it to the manager's Core account (a value transfer to the HYPE system address).
     /// @param minWhypeOut minimum WHYPE out of the launch-token→WHYPE swap (slippage floor)
-    /// @param minUsdcOut  minimum USDC out of the WHYPE→USDC swap (slippage floor)
-    /// @dev Owner/keeper-gated because the floors must come from a fresh quote: the keeper
-    ///      reads the manager's post-{harvest} balances, quotes each leg, applies its
-    ///      tolerance, and passes the floors here so the swaps can't be sandwiched. Still
-    ///      no fund-withdraw path — output only lands in the manager's Core account. Pass
-    ///      `0` for a leg that has no input this run.
-    function swapAndBridge(uint256 minWhypeOut, uint256 minUsdcOut) external onlyOwnerOrKeeper {
+    /// @dev Owner/keeper-gated: the floor must come from a fresh quote so the swap can't be
+    ///      sandwiched. No fund-withdraw path — the HYPE only lands in the manager's Core
+    ///      account. Pass `0` when there is no launch-token side to swap this run.
+    function bridgeToCore(uint256 minWhypeOut) external onlyOwnerOrKeeper {
         // 1. Swap the launch-token side → WHYPE in the launch pool.
         uint256 tokenBal = token.balanceOf(address(this));
         if (tokenBal > 0) {
@@ -244,34 +259,35 @@ contract SpcxdManager {
             );
         }
 
-        // 2. Swap all WHYPE → USDC.
+        // 2. Unwrap all WHYPE → native HYPE.
         uint256 whypeBal = IERC20(whype).balanceOf(address(this));
         if (whypeBal > 0) {
-            IERC20(whype).approve(address(router), whypeBal);
-            router.exactInputSingle(
-                ISwapRouter.ExactInputSingleParams({
-                    tokenIn: whype,
-                    tokenOut: usdc,
-                    fee: whypeUsdcFee,
-                    recipient: address(this),
-                    deadline: block.timestamp,
-                    amountIn: whypeBal,
-                    amountOutMinimum: minUsdcOut,
-                    sqrtPriceLimitX96: 0
-                })
-            );
+            IWHYPE(whype).withdraw(whypeBal);
         }
 
-        // 3. Bridge USDC EVM→Core (transfer to the USDC system address credits our Core account).
-        uint256 usdcBal = IERC20(usdc).balanceOf(address(this));
-        if (usdcBal > 0) {
-            IERC20(usdc).transfer(HyperCore.systemAddress(USDC_CORE_ID), usdcBal);
+        // 3. Bridge native HYPE EVM→Core (value transfer to the HYPE system address).
+        uint256 hypeBal = address(this).balance;
+        if (hypeBal > 0) {
+            (bool ok,) = HYPE_SYSTEM.call{value: hypeBal}("");
+            require(ok, "hype bridge failed");
         }
-
-        emit SwappedAndBridged(usdcBal);
+        emit BridgedToCore(hypeBal);
     }
 
-    // -------------------------------------------------------------- step 2: buy
+    // ------------------------------------------------------------- step 3: sell for USDC
+
+    /// @notice IOC sell of Core HYPE for USDC on the HYPE/USDC book — gets the USDC the
+    ///         SPCXD buy needs (token-0 USDC can only be acquired by trading on Core).
+    /// @param px1e8 limit price, human × 1e8 (priced off the live book by the keeper)
+    /// @param sz1e8 size, human × 1e8
+    function sellHypeForUsdc(uint64 px1e8, uint64 sz1e8) external onlyOwnerOrKeeper {
+        (uint64 hypeTotal,,) = HyperCore.spotBalance(address(this), HYPE_CORE_ID);
+        require(hypeTotal > 0, "no core hype");
+        HyperCore.limitOrder(HYPE_USDC_ASSET, false, px1e8, sz1e8); // isBuy=false: sell HYPE for USDC
+        emit SoldHypeForUsdc(px1e8, sz1e8);
+    }
+
+    // -------------------------------------------------------------- step 4: buy SPCXD
 
     /// @notice IOC ("market-style") buy on the SPCXD/USDC book using the Core USDC balance.
     /// @param px1e8 limit price, human × 1e8 (priced off-chain from the live book)
@@ -285,7 +301,7 @@ contract SpcxdManager {
         emit BoughtSpcxd(px1e8, sz1e8);
     }
 
-    // ------------------------------------------------------------ step 3: deliver
+    // ------------------------------------------------------------- step 5: deliver
 
     /// @notice Move the bought SPCXD from the manager's Core account to the token's Core
     ///         account and book it as a reward for holders.
@@ -299,6 +315,11 @@ contract SpcxdManager {
     }
 
     // ----------------------------------------------------------------- views
+
+    /// @notice HYPE queued in the manager's Core account, core 8-dec units.
+    function coreHype() external view returns (uint64 total) {
+        (total,,) = HyperCore.spotBalance(address(this), HYPE_CORE_ID);
+    }
 
     /// @notice USDC queued in the manager's Core account, core 8-dec units.
     function coreUsdc() external view returns (uint64 total) {
@@ -327,7 +348,7 @@ contract SpcxdManager {
         emit LiquidityWithdrawn(to, id);
     }
 
-    /// @notice Set the keeper bot allowed to call {buySpcxd}/{swapAndBridge}. (No fund-withdraw power.)
+    /// @notice Set the keeper bot allowed to run the pipeline orders. (No fund-withdraw power.)
     function setKeeper(address keeper_) external onlyOwner {
         keeper = keeper_;
         emit KeeperSet(keeper_);

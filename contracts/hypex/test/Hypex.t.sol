@@ -48,6 +48,15 @@ contract MockERC20 {
         balanceOf[to] += value;
         return true;
     }
+
+    // WHYPE-style unwrap: burn wrapped balance, pay out native HYPE (mock must hold ETH).
+    function withdraw(uint256 amount) external {
+        balanceOf[msg.sender] -= amount;
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, "withdraw fail");
+    }
+
+    receive() external payable {}
 }
 
 /// Position manager stub: `collect` mints the configured WHYPE fee to the caller;
@@ -120,7 +129,7 @@ contract MockSwapRouter {
         MockERC20Like(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
         amountOut = (p.amountIn * rate[p.tokenIn][p.tokenOut]) / 1e18;
         require(amountOut >= p.amountOutMinimum, "slippage");
-        MockERC20(p.tokenOut).mint(p.recipient, amountOut);
+        MockERC20(payable(p.tokenOut)).mint(p.recipient, amountOut);
     }
 }
 
@@ -129,13 +138,15 @@ contract HypexTest is Test {
     address internal constant SPOT_BALANCE = 0x0000000000000000000000000000000000000801;
     uint64 internal constant SPCXD = 610;
     uint64 internal constant USDC_CORE = 0;
+    uint64 internal constant HYPE_CORE = 150;
     uint32 internal constant SPCXD_ASSET = 10465;
+    uint32 internal constant HYPE_ASSET = 10107;
+    address internal constant HYPE_SYSTEM = 0x2222222222222222222222222222222222222222;
 
     SpcxdToken token;
     SpcxdManager manager;
 
     MockERC20 whype;
-    MockERC20 usdc;
     MockNFPM nfpm;
     MockSwapRouter swapRouter;
 
@@ -144,7 +155,6 @@ contract HypexTest is Test {
 
     function setUp() public {
         whype = new MockERC20("WHYPE");
-        usdc = new MockERC20("USDC");
         nfpm = new MockNFPM();
         swapRouter = new MockSwapRouter();
         nfpm.setWhype(whype);
@@ -154,11 +164,9 @@ contract HypexTest is Test {
         manager = new SpcxdManager(
             token,
             address(whype),
-            address(usdc),
             INonfungiblePositionManager(address(nfpm)),
             ISwapRouter(address(swapRouter)),
-            10_000, // 1% launch pool
-            500 // WHYPE/USDC tier
+            10_000 // 1% launch pool
         );
         token.setManager(address(manager));
 
@@ -236,6 +244,19 @@ contract HypexTest is Test {
         assertEq(keccak256(_coreData()), keccak256(expected));
     }
 
+    // 3b. Sell HYPE for USDC emits an IOC SELL on the HYPE/USDC book (asset 10107).
+    function test_sellHypeOrderEncoding() public {
+        _mockSpot(address(manager), HYPE_CORE, 1_000e8); // HYPE sitting on Core
+
+        manager.sellHypeForUsdc(44e8, 9e8);
+
+        bytes memory expected = abi.encodePacked(
+            uint8(1), uint8(0), uint8(0), uint8(HyperCore.ACTION_LIMIT_ORDER),
+            abi.encode(HYPE_ASSET, false, uint64(44e8), uint64(9e8), false, uint8(3), uint128(0))
+        );
+        assertEq(keccak256(_coreData()), keccak256(expected));
+    }
+
     // 4. Deliver spot-sends bought SPCXD to the token and books it as a reward.
     function test_deliver() public {
         token.transfer(alice, 10_000e18); // all shares to alice
@@ -293,30 +314,30 @@ contract HypexTest is Test {
         assertEq(HyperCore.systemAddress(610), 0x2000000000000000000000000000000000000262);
     }
 
-    // 8. Pipeline: harvest (collect) → swapAndBridge (token→WHYPE→USDC) → bridge to Core.
+    // 8. Pipeline: harvest (collect) → bridgeToCore (token→WHYPE, unwrap, HYPE→Core).
     function test_harvestPipeline() public {
         // 100 HYPEX (token side) already in the manager; collect() mints 50 WHYPE.
         token.transfer(address(manager), 100e18);
         nfpm.setWhypeFee(50e18);
-
         swapRouter.setRate(address(token), address(whype), 0.5e18); // 100 HYPEX → 50 WHYPE
-        swapRouter.setRate(address(whype), address(usdc), 2e18); // 100 WHYPE → 200 USDC
+        // Fund the WHYPE mock with native HYPE so withdraw() can pay out (50 + 50 = 100).
+        vm.deal(address(whype), 100e18);
 
         manager.harvest(); // permissionless collect
-        manager.swapAndBridge(0, 0);
+        manager.bridgeToCore(0);
 
-        // 50 collected + 50 swapped = 100 WHYPE → 200 USDC, all bridged out.
-        address bridge = HyperCore.systemAddress(USDC_CORE);
-        assertEq(usdc.balanceOf(bridge), 200e18);
-        assertEq(usdc.balanceOf(address(manager)), 0);
+        // 100 WHYPE unwrapped → 100 HYPE bridged to the HYPE system address.
+        assertEq(HYPE_SYSTEM.balance, 100e18);
         assertEq(whype.balanceOf(address(manager)), 0);
         assertEq(token.balanceOf(address(manager)), 0);
+        assertEq(address(manager).balance, 0);
     }
 
-    // 9. swapAndBridge enforces the slippage floor and is owner/keeper-gated; harvest is open.
+    // 9. bridgeToCore enforces the slippage floor and is owner/keeper-gated; harvest is open.
     function test_harvestSlippageAndGating() public {
         token.transfer(address(manager), 100e18);
         swapRouter.setRate(address(token), address(whype), 0.5e18);
+        vm.deal(address(whype), 100e18);
 
         // Anyone can collect.
         vm.prank(alice);
@@ -324,18 +345,17 @@ contract HypexTest is Test {
 
         // Floor above achievable output reverts the swap.
         vm.expectRevert("slippage");
-        manager.swapAndBridge(999e18, 0);
+        manager.bridgeToCore(999e18);
 
-        // A random caller can't swap.
+        // A random caller can't bridge.
         vm.prank(alice);
         vm.expectRevert("not owner/keeper");
-        manager.swapAndBridge(0, 0);
+        manager.bridgeToCore(0);
 
         // The keeper can.
         manager.setKeeper(alice);
-        swapRouter.setRate(address(whype), address(usdc), 1e18);
         vm.prank(alice);
-        manager.swapAndBridge(0, 0);
+        manager.bridgeToCore(0);
     }
 
     // 10. Seed: single-sided mint deposits the full token balance into one V3 position.

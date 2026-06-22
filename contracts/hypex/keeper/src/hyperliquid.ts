@@ -80,4 +80,32 @@ export function priceBuy(
   return { px1e8, sz1e8, bestAsk: Number(asks[0].px) };
 }
 
+/**
+ * Price an IOC market-style SELL of `sizeHuman` base tokens for the quote (e.g. HYPE→USDC).
+ * Crosses the bid side: limit price = best bid shaved DOWN by `slippageBps` so the IOC fills.
+ */
+export function priceSell(
+  book: L2Book,
+  sizeHuman: number,
+  slippageBps: number,
+  szDecimals: number,
+): BuyQuote | null {
+  const bids = book.levels[0];
+  if (!bids || bids.length === 0) return null;
+
+  const slip = slippageBps / 10_000;
+  const limitPx = Number(bids[0].px) * (1 - slip);
+
+  const szScale = 10 ** szDecimals;
+  const sizeRounded = Math.floor(sizeHuman * szScale) / szScale;
+  if (sizeRounded <= 0 || limitPx <= 0) return null;
+
+  const px1e8 = BigInt(Math.round(limitPx * 1e8));
+  const sz1e8 = BigInt(Math.round(sizeRounded * 1e8));
+  if (px1e8 <= 0n || sz1e8 <= 0n) return null;
+  if (px1e8 > MAX_U64 || sz1e8 > MAX_U64) throw new Error("px/sz overflow uint64");
+
+  return { px1e8, sz1e8, bestAsk: Number(bids[0].px) };
+}
+
 const MAX_U64 = (1n << 64n) - 1n;

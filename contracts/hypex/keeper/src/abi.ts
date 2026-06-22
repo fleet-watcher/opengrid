@@ -4,18 +4,19 @@
 export const managerAbi = [
   { type: "function", name: "harvest", stateMutability: "nonpayable", inputs: [], outputs: [
     { name: "collected0", type: "uint256" }, { name: "collected1", type: "uint256" } ] },
-  { type: "function", name: "swapAndBridge", stateMutability: "nonpayable",
-    inputs: [{ name: "minWhypeOut", type: "uint256" }, { name: "minUsdcOut", type: "uint256" }], outputs: [] },
+  { type: "function", name: "bridgeToCore", stateMutability: "nonpayable",
+    inputs: [{ name: "minWhypeOut", type: "uint256" }], outputs: [] },
+  { type: "function", name: "sellHypeForUsdc", stateMutability: "nonpayable",
+    inputs: [{ name: "px1e8", type: "uint64" }, { name: "sz1e8", type: "uint64" }], outputs: [] },
   { type: "function", name: "buySpcxd", stateMutability: "nonpayable",
     inputs: [{ name: "px1e8", type: "uint64" }, { name: "sz1e8", type: "uint64" }], outputs: [] },
   { type: "function", name: "deliverToToken", stateMutability: "nonpayable", inputs: [], outputs: [] },
+  { type: "function", name: "coreHype", stateMutability: "view", inputs: [], outputs: [{ type: "uint64" }] },
   { type: "function", name: "coreUsdc", stateMutability: "view", inputs: [], outputs: [{ type: "uint64" }] },
   { type: "function", name: "coreSpcxd", stateMutability: "view", inputs: [], outputs: [{ type: "uint64" }] },
   { type: "function", name: "token", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
   { type: "function", name: "whype", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
-  { type: "function", name: "usdc", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
   { type: "function", name: "launchPoolFee", stateMutability: "view", inputs: [], outputs: [{ type: "uint24" }] },
-  { type: "function", name: "whypeUsdcFee", stateMutability: "view", inputs: [], outputs: [{ type: "uint24" }] },
 ] as const;
 
 export const erc20Abi = [
