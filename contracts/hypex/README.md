@@ -51,14 +51,20 @@ overridable defaults in `script/Deploy.s.sol` and `keeper/.env.example`.
 | HyperSwap V3 SwapRouter (with deadline) | `0x4E2960a8cd19B467b82d26D83fAcb0fAE26b094D` |
 | HyperSwap V3 NonfungiblePositionManager | `0x6eDA206207c09e5428F281761DdC0D300851fBC8` |
 | HyperSwap V3 Quoter v2 (keeper) | `0x03A918028f22D9E1473B7959C927AD7425A45C7C` |
-| USDC — Hyperliquid (bridges to Core token 0) | `0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24` |
-| USDC — Circle native (alternative) | `0xb88339CB7199b77E23DB6E890353E22632Ba630f` |
+| **USD₮0** — EVM stable w/ the deep WHYPE V3 pool (0.05%) | `0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb` |
+| WHYPE/USD₮0 V3 pool (0.05%) | `0x337b56d87a6185cd46af3ac2cdf03cbc37070c30` |
 
-> **USDC caveat:** the bridge only credits your Core USDC if the EVM USDC you use is
-> the one linked to HyperCore token 0. The spec/validated build used the Hyperliquid
-> USDC (`0x6B9E…0A24`); Circle's native USDC launched later. Confirm which one (a)
-> bridges to Core token 0 and (b) has a liquid WHYPE/USDC V3 pool **before** mainnet,
-> and set `WHYPE_USDC_FEE` to that pool's fee tier.
+> **Stable caveat (mainnet-fork verified).** The harvest stable leg uses **USD₮0**, not
+> USDC: Circle USDC (`0xb88339…`) has **no** WHYPE V3 pool, and the spec's USDC
+> `0x6B9E…0A24` **reverts on every ERC20 call** (it is not a usable token). USD₮0 is the
+> only EVM stable with deep WHYPE liquidity.
+>
+> ⚠️ **Open item (HyperCore side, not fork-verifiable).** `SpcxdManager` hardcodes
+> `USDC_CORE_ID = 0` and the SPCXD/USDC spot asset `10465` — it assumes the buy is quoted
+> in USDC on Core. If the harvested EVM stable is USD₮0, confirm whether (a) SPCXD is
+> actually quoted in USD₮0 on Core (then update those constants) or (b) a USD₮0→USDC hop on
+> Core is needed before the buy, and that the stable's bridge system index matches the core
+> id. **Resolve this before mainnet.**
 
 ### Decimals
 
@@ -85,6 +91,25 @@ Ran 11 tests for test/Hypex.t.sol:HypexTest
 The Core-side actions (buy/deliver/claim) are checked against a CoreWriter recorder
 that asserts the exact action-byte encoding; the EVM-side pipeline (collect → swap →
 bridge, with the slippage floor enforced) is checked against mock NFPM/router/ERC20s.
+
+### Mainnet-fork integration (`test/HypexFork.t.sol`)
+
+Run against real HyperSwap V3 mainnet state (no funds, no keys):
+
+```bash
+forge test --fork-url https://rpc.hyperliquid.xyz/evm --match-contract HypexFork -vv
+```
+
+- `test_fork_seedSingleSided` — deploys and calls `seed()` against the **real NFPM**:
+  creates a real token/WHYPE 1% pool, mints a real V3 position, deposits the full
+  10,000-token supply single-sided (0 left over). ✅
+- `test_fork_swapWhypeToStableAndBridge` — swaps WHYPE→USD₮0 through the **real router
+  and WHYPE/USD₮0 0.05% pool**, then runs the bridge transfer (e.g. 0.1 WHYPE → ~6.6
+  USD₮0). ✅
+
+Without `--fork-url` these no-op (the addresses have no code), so plain `forge test`
+stays at the 11 unit tests. **Note:** the fork can only exercise the EVM side; HyperCore
+actions (buy/spot-send/precompiles) are system-level and not present in fork state.
 
 ## Keeper bot
 
