@@ -1,0 +1,90 @@
+# HYPEX — holders earn SPCXD from the pool fee
+
+HYPEX is a token on [HyperEVM](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm) (chain `999`) whose holders earn **SPCXD** (tokenized SpaceX dStock) out of a **1% pool fee**. The fee is harvested, routed to USDC, bridged to HyperCore, spent buying SPCXD on the HyperCore orderbook, and delivered straight to each holder's own Core account when they claim. No team cut, no fund withdrawal, LP locked by construction.
+
+## Contracts
+
+| File | Purpose |
+| --- | --- |
+| `src/SpcxdToken.sol` | The launch ERC20 (0% tax, 18 dec). Holds the SPCXD dividend accumulator; holders `claimSpcxd()` here. |
+| `src/SpcxdManager.sol` | Custodies the locked LP and runs `harvest → buySpcxd → deliverToToken`. **No** USDC/SPCXD/HYPE withdraw path. |
+| `src/HyperCore.sol` | EVM↔Core bridge library: CoreWriter orderbook orders, spot-send, spot-balance precompile, token system addresses. |
+| `script/Deploy.s.sol` | Deploys token + manager and wires them. |
+| `test/Hypex.t.sol` | 7 unit tests (all passing). |
+
+## How it works
+
+**Dividend engine (magnified-dividend-per-share, O(1), no holder list).**
+`shares[a]` is `a`'s balance (0 if excluded), `totalShares` the sum over non-excluded holders. `magSpcxdPerShare` accumulates SPCXD per share, scaled by `2^128`, denominated in SPCXD core 8-dec units. A per-account `correction` (int256) plus `withdrawnSpcxd` keep each holder's owed amount exact across transfers — every `_transfer` re-syncs `shares` for both sides and shifts their corrections, so accrued SPCXD is never lost and there is no enumeration.
+
+- `notifyReward(uint64 amount)` (manager-only): if `totalShares == 0` the reward is **buffered** for the next call; otherwise `magSpcxdPerShare += (amount + buffered) * 2^128 / totalShares`. `amount` is in SPCXD core units and the SPCXD is already in the token's Core account.
+- `withdrawableSpcxd(a) = (magSpcxdPerShare * shares[a] + correction[a]) / 2^128 − withdrawnSpcxd[a]`.
+- `claimSpcxd()` spot-sends the owed SPCXD (core id `610`) to the caller's own Core account. Async — it arrives 1–2 blocks later. The caller can then sell it on the orderbook with no bridge.
+- Exclusions (pool, manager, reserve, dead) hold 0 shares so they don't dilute real holders.
+
+**The pipeline (manager).**
+1. `seed(sqrtPriceX96, tickLower, tickUpper)` (owner, one-shot): creates the token/WHYPE 1% pool and mints the manager's full token balance as a single-sided (token-only) position. The LP NFT stays in the manager forever — there is no withdraw, so the LP is locked by construction.
+2. `harvest()` (permissionless): `collect()` the accrued fees → swap the token side to WHYPE in the launch pool → swap all WHYPE to USDC → bridge USDC EVM→Core.
+3. `buySpcxd(px1e8, sz1e8)` (owner/keeper): IOC ("market-style") buy on the SPCXD/USDC book (asset `10465 = 10000 + 465`) using the Core USDC balance. Owner/keeper-gated because it needs live market data and dStock trades only during the SpaceX session.
+4. `deliverToToken()` (permissionless): spot-send the bought SPCXD from the manager's Core account to the token's Core account, then `notifyReward` to book it.
+
+### Mainnet identifiers (chain 999)
+
+- SPCXD core token id `610`; SPCXD spot order asset `10465`.
+- USDC core id `0`; CoreWriter `0x33…33`; spot-balance precompile `0x…0801`; HYPE system address `0x22…22`.
+- Token system address = `0x20` top byte + token index big-endian (USDC `0` → `0x2000…0000`).
+
+### Decimals
+
+- HYPEX: 18 dec (EVM). USDC: 6 dec EVM / 8 dec Core. SPCXD: 8 dec Core (18 dec ERC20 unused).
+- Orderbook px/sz and reward amounts: human × `1e8` (SPCXD core 8-dec units).
+
+## Build & test
+
+```bash
+cd contracts/hypex
+git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std
+forge test -vv
+```
+
+```
+Ran 7 tests for test/Hypex.t.sol:HypexTest
+[PASS] test_buffer()           [PASS] test_buyOrderEncoding()  [PASS] test_claimSpotSend()
+[PASS] test_deliver()          [PASS] test_distributionMath()  [PASS] test_managerGating()
+[PASS] test_systemAddress()
+7 passed; 0 failed
+```
+
+## Deploy
+
+```bash
+export PRIVATE_KEY=0x...
+export WHYPE=0x5555555555555555555555555555555555555555
+export USDC=0x...            # EVM USDC (6 dec)
+export NFPM=0x...            # Hyperswap NonfungiblePositionManager
+export SWAP_ROUTER=0x...     # Hyperswap SwapRouter
+export TOTAL_SUPPLY=10000
+forge script script/Deploy.s.sol --rpc-url hyperevm --broadcast
+```
+
+After deploy: airdrop HYLD holders 1:1 from the deployer balance (snapshot ≈ 50 holders, ~4,940 HYPEX), transfer the remaining LP allocation to the manager, then call `manager.seed(...)` once.
+
+> **HyperEVM big blocks:** contract deploys often exceed the 2M small-block gas limit. Flip your deployer to big blocks before deploying, then back.
+
+> **CoreWriter caller rule (validated on mainnet):** CoreWriter actions only execute when the sender is a *contract*, not an EOA — which is exactly why the token and manager run them. The token-bridge transfer to a system address works from either.
+
+## Trust properties
+
+- **No team cut** — 100% of the fee reaches holders as SPCXD.
+- **No fund withdraw** — the manager cannot send USDC/SPCXD/HYPE to the owner; collected value can only become a reward.
+- **LP locked by construction** — there is no `withdrawLiquidity`; the position NFT cannot leave the manager.
+- **0% transfer tax. Pro-rata, claim-based, O(1)** — no holder list.
+
+## Honest constraints
+
+- **dStock market hours** — SPCXD only trades during the SpaceX session; off-hours, fees queue as USDC on Core until the next run. "More SpaceX over time," not "instant per trade."
+- **Async + keeper** — fills and bridges settle 1–2 blocks later; a keeper triggers `buySpcxd`.
+- **Slippage** — EVM swaps currently pass `amountOutMinimum = 0`; add bounds before real size. Large batches move the book.
+- **Min order size** — small fees batch up between runs.
+
+This is a reference implementation and has **not been audited**. Test on HyperEVM testnet (chain `998`) before putting real funds behind it.
