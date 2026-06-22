@@ -1,0 +1,19 @@
+{
+  "name": "@opengrid/hypex-keeper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Keeper bot for the HYPEX reward pipeline (harvest → swap → buy SPCXD → deliver).",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node --experimental-strip-types src/keeper.ts"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}

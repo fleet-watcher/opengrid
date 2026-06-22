@@ -10,7 +10,8 @@ HYPEX is a token on [HyperEVM](https://hyperliquid.gitbook.io/hyperliquid-docs/f
 | `src/SpcxdManager.sol` | Custodies the locked LP and runs `harvest → buySpcxd → deliverToToken`. **No** USDC/SPCXD/HYPE withdraw path. |
 | `src/HyperCore.sol` | EVM↔Core bridge library: CoreWriter orderbook orders, spot-send, spot-balance precompile, token system addresses. |
 | `script/Deploy.s.sol` | Deploys token + manager and wires them. |
-| `test/Hypex.t.sol` | 7 unit tests (all passing). |
+| `test/Hypex.t.sol` | 10 unit tests (all passing). |
+| `keeper/` | TypeScript keeper bot (viem) that drives the pipeline during market hours. |
 
 ## How it works
 
@@ -24,9 +25,12 @@ HYPEX is a token on [HyperEVM](https://hyperliquid.gitbook.io/hyperliquid-docs/f
 
 **The pipeline (manager).**
 1. `seed(sqrtPriceX96, tickLower, tickUpper)` (owner, one-shot): creates the token/WHYPE 1% pool and mints the manager's full token balance as a single-sided (token-only) position. The LP NFT stays in the manager forever — there is no withdraw, so the LP is locked by construction.
-2. `harvest()` (permissionless): `collect()` the accrued fees → swap the token side to WHYPE in the launch pool → swap all WHYPE to USDC → bridge USDC EVM→Core.
-3. `buySpcxd(px1e8, sz1e8)` (owner/keeper): IOC ("market-style") buy on the SPCXD/USDC book (asset `10465 = 10000 + 465`) using the Core USDC balance. Owner/keeper-gated because it needs live market data and dStock trades only during the SpaceX session.
-4. `deliverToToken()` (permissionless): spot-send the bought SPCXD from the manager's Core account to the token's Core account, then `notifyReward` to book it.
+2. `harvest()` (permissionless): `collect()` the accrued fees into the manager. Slippage-free, so anyone may pull fees in.
+3. `swapAndBridge(minWhypeOut, minUsdcOut)` (owner/keeper): swap the token side → WHYPE → USDC and bridge USDC EVM→Core. The slippage floors come from a fresh quote (the keeper reads the post-harvest balances, quotes each leg, and applies its tolerance) so the swaps can't be sandwiched.
+4. `buySpcxd(px1e8, sz1e8)` (owner/keeper): IOC ("market-style") buy on the SPCXD/USDC book (asset `10465 = 10000 + 465`) using the Core USDC balance. Owner/keeper-gated because it needs live market data and dStock trades only during the SpaceX session.
+5. `deliverToToken()` (permissionless): spot-send the bought SPCXD from the manager's Core account to the token's Core account, then `notifyReward` to book it.
+
+The collect and deliver legs are permissionless; only the slippage-sensitive swap and the market-priced buy are keeper-gated. None of them can move funds to the owner.
 
 ### Mainnet identifiers (chain 999)
 
@@ -48,12 +52,35 @@ forge test -vv
 ```
 
 ```
-Ran 7 tests for test/Hypex.t.sol:HypexTest
+Ran 10 tests for test/Hypex.t.sol:HypexTest
 [PASS] test_buffer()           [PASS] test_buyOrderEncoding()  [PASS] test_claimSpotSend()
 [PASS] test_deliver()          [PASS] test_distributionMath()  [PASS] test_managerGating()
-[PASS] test_systemAddress()
-7 passed; 0 failed
+[PASS] test_systemAddress()    [PASS] test_harvestPipeline()   [PASS] test_harvestSlippageAndGating()
+[PASS] test_seedLocksLp()
+10 passed; 0 failed
 ```
+
+The Core-side actions (buy/deliver/claim) are checked against a CoreWriter recorder
+that asserts the exact action-byte encoding; the EVM-side pipeline (collect → swap →
+bridge, with the slippage floor enforced) is checked against mock NFPM/router/ERC20s.
+
+## Keeper bot
+
+`keeper/` is a standalone TypeScript bot (viem + the Hyperliquid Info API) that runs
+the pipeline during market hours:
+
+```bash
+cd contracts/hypex/keeper
+pnpm install --ignore-workspace
+cp .env.example .env   # fill in PRIVATE_KEY, MANAGER_ADDRESS, QUOTER_ADDRESS …
+pnpm start             # one pass; set LOOP_SECONDS=300 to repeat
+```
+
+Each pass: `harvest()` → read balances, quote each swap leg and derive slippage floors,
+`swapAndBridge(min,min)` → read `coreUsdc()` → price an IOC buy off the live SPCXD/USDC
+book (cross the spread + buffer, size = USDC/px) → `buySpcxd(px,sz)` → poll `coreSpcxd()`
+for the fill → `deliverToToken()`. Set the keeper wallet on-chain with `manager.setKeeper(addr)`
+— it can run `swapAndBridge`/`buySpcxd` but has **no** fund-withdraw power.
 
 ## Deploy
 
@@ -84,7 +111,7 @@ After deploy: airdrop HYLD holders 1:1 from the deployer balance (snapshot ≈ 5
 
 - **dStock market hours** — SPCXD only trades during the SpaceX session; off-hours, fees queue as USDC on Core until the next run. "More SpaceX over time," not "instant per trade."
 - **Async + keeper** — fills and bridges settle 1–2 blocks later; a keeper triggers `buySpcxd`.
-- **Slippage** — EVM swaps currently pass `amountOutMinimum = 0`; add bounds before real size. Large batches move the book.
+- **Slippage** — EVM swaps enforce keeper-supplied `minWhypeOut`/`minUsdcOut` floors (quoted fresh, tolerance `SLIPPAGE_BPS`) and the IOC buy crosses the book by the same tolerance. Large batches still move the book — size accordingly.
 - **Min order size** — small fees batch up between runs.
 
 This is a reference implementation and has **not been audited**. Test on HyperEVM testnet (chain `998`) before putting real funds behind it.

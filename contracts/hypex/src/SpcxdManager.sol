@@ -100,7 +100,8 @@ contract SpcxdManager {
     // --------------------------------------------------------------- events
 
     event Seeded(address indexed pool, uint256 positionId, uint256 tokenLiquidity);
-    event Harvested(uint256 collected0, uint256 collected1, uint256 usdcBridged);
+    event Harvested(uint256 collected0, uint256 collected1);
+    event SwappedAndBridged(uint256 usdcBridged);
     event BoughtSpcxd(uint64 px1e8, uint64 sz1e8);
     event Delivered(uint64 amount);
     event KeeperSet(address indexed keeper);
@@ -189,12 +190,11 @@ contract SpcxdManager {
 
     // -------------------------------------------------------------- step 1: harvest
 
-    /// @notice Collect the accrued 1% fees, route everything to USDC, and bridge it to Core.
-    /// @dev Permissionless. Leaves USDC queued in the manager's Core account for the next buy.
-    ///      Swaps currently use `amountOutMinimum = 0`; add slippage bounds before real size.
-    function harvest() external {
-        // 1. Collect accrued fees (WHYPE + launch token) from the locked position.
-        (uint256 collected0, uint256 collected1) = nfpm.collect(
+    /// @notice Collect the accrued 1% fees from the locked position into the manager.
+    /// @dev Permissionless. Slippage-free (no swap), so anyone may pull fees in.
+    ///      Pair with {swapAndBridge}, which the keeper calls with fresh slippage floors.
+    function harvest() external returns (uint256 collected0, uint256 collected1) {
+        (collected0, collected1) = nfpm.collect(
             INonfungiblePositionManager.CollectParams({
                 tokenId: positionId,
                 recipient: address(this),
@@ -202,8 +202,19 @@ contract SpcxdManager {
                 amount1Max: type(uint128).max
             })
         );
+        emit Harvested(collected0, collected1);
+    }
 
-        // 2. Swap the launch-token side → WHYPE in the launch pool.
+    /// @notice Route the manager's launch-token + WHYPE balance to USDC and bridge it to Core.
+    /// @param minWhypeOut minimum WHYPE out of the launch-token→WHYPE swap (slippage floor)
+    /// @param minUsdcOut  minimum USDC out of the WHYPE→USDC swap (slippage floor)
+    /// @dev Owner/keeper-gated because the floors must come from a fresh quote: the keeper
+    ///      reads the manager's post-{harvest} balances, quotes each leg, applies its
+    ///      tolerance, and passes the floors here so the swaps can't be sandwiched. Still
+    ///      no fund-withdraw path — output only lands in the manager's Core account. Pass
+    ///      `0` for a leg that has no input this run.
+    function swapAndBridge(uint256 minWhypeOut, uint256 minUsdcOut) external onlyOwnerOrKeeper {
+        // 1. Swap the launch-token side → WHYPE in the launch pool.
         uint256 tokenBal = token.balanceOf(address(this));
         if (tokenBal > 0) {
             token.approve(address(router), tokenBal);
@@ -215,13 +226,13 @@ contract SpcxdManager {
                     recipient: address(this),
                     deadline: block.timestamp,
                     amountIn: tokenBal,
-                    amountOutMinimum: 0,
+                    amountOutMinimum: minWhypeOut,
                     sqrtPriceLimitX96: 0
                 })
             );
         }
 
-        // 3. Swap all WHYPE → USDC.
+        // 2. Swap all WHYPE → USDC.
         uint256 whypeBal = IERC20(whype).balanceOf(address(this));
         if (whypeBal > 0) {
             IERC20(whype).approve(address(router), whypeBal);
@@ -233,19 +244,19 @@ contract SpcxdManager {
                     recipient: address(this),
                     deadline: block.timestamp,
                     amountIn: whypeBal,
-                    amountOutMinimum: 0,
+                    amountOutMinimum: minUsdcOut,
                     sqrtPriceLimitX96: 0
                 })
             );
         }
 
-        // 4. Bridge USDC EVM→Core (transfer to the USDC system address credits our Core account).
+        // 3. Bridge USDC EVM→Core (transfer to the USDC system address credits our Core account).
         uint256 usdcBal = IERC20(usdc).balanceOf(address(this));
         if (usdcBal > 0) {
             IERC20(usdc).transfer(HyperCore.systemAddress(USDC_CORE_ID), usdcBal);
         }
 
-        emit Harvested(collected0, collected1, usdcBal);
+        emit SwappedAndBridged(usdcBal);
     }
 
     // -------------------------------------------------------------- step 2: buy

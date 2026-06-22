@@ -16,6 +16,106 @@ contract MockCoreWriter {
     }
 }
 
+/// Minimal mintable ERC20 for the WHYPE/USDC legs of the EVM pipeline.
+contract MockERC20 {
+    string public name;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    constructor(string memory name_) {
+        name = name_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 value) external returns (bool) {
+        allowance[msg.sender][spender] = value;
+        return true;
+    }
+
+    function transfer(address to, uint256 value) external returns (bool) {
+        balanceOf[msg.sender] -= value;
+        balanceOf[to] += value;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 value) external returns (bool) {
+        uint256 a = allowance[from][msg.sender];
+        if (a != type(uint256).max) allowance[from][msg.sender] = a - value;
+        balanceOf[from] -= value;
+        balanceOf[to] += value;
+        return true;
+    }
+}
+
+/// Position manager stub: `collect` mints the configured WHYPE fee to the caller;
+/// `mint`/`createAndInitializePoolIfNecessary` back the seed path.
+contract MockNFPM {
+    MockERC20 public whype;
+    uint256 public whypeFee;
+    uint256 public nextId = 1;
+
+    function setWhype(MockERC20 w) external {
+        whype = w;
+    }
+
+    function setWhypeFee(uint256 amount) external {
+        whypeFee = amount;
+    }
+
+    function createAndInitializePoolIfNecessary(address, address, uint24, uint160)
+        external
+        pure
+        returns (address)
+    {
+        return address(0xBEEF);
+    }
+
+    function mint(INonfungiblePositionManager.MintParams calldata p)
+        external
+        returns (uint256, uint128, uint256, uint256)
+    {
+        // Pull whichever side carries the single-sided token amount.
+        uint256 amt = p.amount0Desired + p.amount1Desired;
+        address tok = p.amount0Desired > 0 ? p.token0 : p.token1;
+        MockERC20Like(tok).transferFrom(msg.sender, address(this), amt);
+        return (nextId++, 0, 0, 0);
+    }
+
+    function collect(INonfungiblePositionManager.CollectParams calldata p)
+        external
+        returns (uint256, uint256)
+    {
+        if (whypeFee > 0) whype.mint(p.recipient, whypeFee);
+        return (whypeFee, 0);
+    }
+}
+
+interface MockERC20Like {
+    function transferFrom(address, address, uint256) external returns (bool);
+}
+
+/// Swap router stub with a fixed tokenIn→tokenOut rate (1e18-scaled). Enforces minOut.
+contract MockSwapRouter {
+    mapping(address => mapping(address => uint256)) public rate; // rate[in][out], 1e18
+
+    function setRate(address tokenIn, address tokenOut, uint256 rateE18) external {
+        rate[tokenIn][tokenOut] = rateE18;
+    }
+
+    function exactInputSingle(ISwapRouter.ExactInputSingleParams calldata p)
+        external
+        returns (uint256 amountOut)
+    {
+        MockERC20Like(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
+        amountOut = (p.amountIn * rate[p.tokenIn][p.tokenOut]) / 1e18;
+        require(amountOut >= p.amountOutMinimum, "slippage");
+        MockERC20(p.tokenOut).mint(p.recipient, amountOut);
+    }
+}
+
 contract HypexTest is Test {
     address internal constant CORE_WRITER = 0x3333333333333333333333333333333333333333;
     address internal constant SPOT_BALANCE = 0x0000000000000000000000000000000000000801;
@@ -26,23 +126,29 @@ contract HypexTest is Test {
     SpcxdToken token;
     SpcxdManager manager;
 
-    address whype = makeAddr("whype");
-    address usdc = makeAddr("usdc");
-    address nfpm = makeAddr("nfpm");
-    address swapRouter = makeAddr("router");
+    MockERC20 whype;
+    MockERC20 usdc;
+    MockNFPM nfpm;
+    MockSwapRouter swapRouter;
 
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
 
     function setUp() public {
+        whype = new MockERC20("WHYPE");
+        usdc = new MockERC20("USDC");
+        nfpm = new MockNFPM();
+        swapRouter = new MockSwapRouter();
+        nfpm.setWhype(whype);
+
         // 10,000 HYPEX, full supply to this test contract (acts as deployer/treasury).
         token = new SpcxdToken("HYPEX", "HYPEX", 10_000e18, address(this));
         manager = new SpcxdManager(
             token,
-            whype,
-            usdc,
-            INonfungiblePositionManager(nfpm),
-            ISwapRouter(swapRouter),
+            address(whype),
+            address(usdc),
+            INonfungiblePositionManager(address(nfpm)),
+            ISwapRouter(address(swapRouter)),
             10_000, // 1% launch pool
             500 // WHYPE/USDC tier
         );
@@ -177,5 +283,66 @@ contract HypexTest is Test {
         assertEq(HyperCore.systemAddress(0), 0x2000000000000000000000000000000000000000);
         // 610 = 0x262
         assertEq(HyperCore.systemAddress(610), 0x2000000000000000000000000000000000000262);
+    }
+
+    // 8. Pipeline: harvest (collect) → swapAndBridge (token→WHYPE→USDC) → bridge to Core.
+    function test_harvestPipeline() public {
+        // 100 HYPEX (token side) already in the manager; collect() mints 50 WHYPE.
+        token.transfer(address(manager), 100e18);
+        nfpm.setWhypeFee(50e18);
+
+        swapRouter.setRate(address(token), address(whype), 0.5e18); // 100 HYPEX → 50 WHYPE
+        swapRouter.setRate(address(whype), address(usdc), 2e18); // 100 WHYPE → 200 USDC
+
+        manager.harvest(); // permissionless collect
+        manager.swapAndBridge(0, 0);
+
+        // 50 collected + 50 swapped = 100 WHYPE → 200 USDC, all bridged out.
+        address bridge = HyperCore.systemAddress(USDC_CORE);
+        assertEq(usdc.balanceOf(bridge), 200e18);
+        assertEq(usdc.balanceOf(address(manager)), 0);
+        assertEq(whype.balanceOf(address(manager)), 0);
+        assertEq(token.balanceOf(address(manager)), 0);
+    }
+
+    // 9. swapAndBridge enforces the slippage floor and is owner/keeper-gated; harvest is open.
+    function test_harvestSlippageAndGating() public {
+        token.transfer(address(manager), 100e18);
+        swapRouter.setRate(address(token), address(whype), 0.5e18);
+
+        // Anyone can collect.
+        vm.prank(alice);
+        manager.harvest();
+
+        // Floor above achievable output reverts the swap.
+        vm.expectRevert("slippage");
+        manager.swapAndBridge(999e18, 0);
+
+        // A random caller can't swap.
+        vm.prank(alice);
+        vm.expectRevert("not owner/keeper");
+        manager.swapAndBridge(0, 0);
+
+        // The keeper can.
+        manager.setKeeper(alice);
+        swapRouter.setRate(address(whype), address(usdc), 1e18);
+        vm.prank(alice);
+        manager.swapAndBridge(0, 0);
+    }
+
+    // 10. Seed: single-sided mint locks the full token balance; the LP NFT stays put.
+    function test_seedLocksLp() public {
+        token.transfer(address(manager), 5_060e18); // LP allocation
+        manager.seed(uint160(1 << 96), 100, 200);
+
+        assertTrue(manager.seeded());
+        assertEq(manager.positionId(), 1);
+        assertEq(manager.pool(), address(0xBEEF));
+        // tokens left the manager into the (mock) position — no withdraw path exists.
+        assertEq(token.balanceOf(address(manager)), 0);
+
+        // One-shot.
+        vm.expectRevert("seeded");
+        manager.seed(uint160(1 << 96), 100, 200);
     }
 }
